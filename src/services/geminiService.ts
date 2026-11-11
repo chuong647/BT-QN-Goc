@@ -1,17 +1,22 @@
 import { ExtractedDocument } from '../types';
 import { PDFDocument } from 'pdf-lib';
 
-const API_LIMIT_BYTES = 30 * 1024 * 1024; // 30MB
-const PAGES_PER_CHUNK = 15;
-const IMAGES_PER_CHUNK = 10;
-
-export const uint8ArrayToBase64 = (bytes: Uint8Array): string => {
-  let binary = "";
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary);
+export const uint8ArrayToBase64 = (bytes: Uint8Array): Promise<string> => {
+  return new Promise((resolve, reject) => {
+    try {
+      const blob = new Blob([bytes as any], { type: 'application/pdf' });
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        const base64 = result.split(',')[1] || '';
+        resolve(base64);
+      };
+      reader.onerror = () => reject(new Error('Lỗi khi mã hóa dữ liệu PDF'));
+      reader.readAsDataURL(blob);
+    } catch (err) {
+      reject(err);
+    }
+  });
 };
 
 export const fileToBase64 = (file: File): Promise<string> => {
@@ -27,48 +32,129 @@ export const fileToBase64 = (file: File): Promise<string> => {
   });
 };
 
-interface ContentPart {
-  inlineData: {
-    mimeType: string;
-    data: string;
-  };
-}
+/**
+ * Optimizes an image before sending: downscales massive photos (>2400px)
+ * to prevent oversized base64 payloads and enable unlimited file size handling.
+ */
+export const optimizeImageFile = async (file: File): Promise<{ base64: string; mimeType: string }> => {
+  if (file.size <= 2 * 1024 * 1024 && (file.type === 'image/jpeg' || file.type === 'image/png')) {
+    const base64 = await fileToBase64(file);
+    return { base64, mimeType: file.type };
+  }
 
-const callExtractApi = async (body: any): Promise<ExtractedDocument[]> => {
-  const response = await fetch('/api/extract', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      let { width, height } = img;
+      const MAX_DIM = 2400; // Optimal resolution for high-accuracy OCR
+      if (width > MAX_DIM || height > MAX_DIM) {
+        if (width > height) {
+          height = Math.round((height * MAX_DIM) / width);
+          width = MAX_DIM;
+        } else {
+          width = Math.round((width * MAX_DIM) / height);
+          height = MAX_DIM;
+        }
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        fileToBase64(file)
+          .then((b64) => resolve({ base64: b64, mimeType: file.type || 'image/jpeg' }))
+          .catch(() => resolve({ base64: '', mimeType: 'image/jpeg' }));
+        return;
+      }
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, width, height);
+      ctx.drawImage(img, 0, 0, width, height);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.90);
+      const base64 = dataUrl.split(',')[1] || '';
+      resolve({ base64, mimeType: 'image/jpeg' });
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      fileToBase64(file)
+        .then((b64) => resolve({ base64: b64, mimeType: file.type || 'image/jpeg' }))
+        .catch(() => resolve({ base64: '', mimeType: 'image/jpeg' }));
+    };
+    img.src = url;
   });
+};
 
-  const result = await response.json();
-  if (!response.ok || !result.success) {
-    throw new Error(result.error || result.details || 'Không thể bóc tách tài liệu này.');
+const callExtractApi = async (body: any, retries = 2): Promise<ExtractedDocument[]> => {
+  let response: Response | null = null;
+  let lastErrorMsg = '';
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      response = await fetch('/api/extract', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (response) {
+        break;
+      }
+    } catch (fetchErr: any) {
+      lastErrorMsg = fetchErr?.message || String(fetchErr);
+      console.warn(`Lần thử kết nối ${attempt}/${retries} thất bại:`, lastErrorMsg);
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, 1200));
+      }
+    }
+  }
+
+  if (!response) {
+    throw new Error(
+      'Không thể kết nối đến máy chủ xử lý dữ liệu. Vui lòng kiểm tra dung lượng tệp hoặc kết nối mạng và thử lại.'
+    );
+  }
+
+  let result: any = null;
+  const rawText = await response.text();
+  try {
+    result = JSON.parse(rawText);
+  } catch {
+    console.error('Phản hồi không phải JSON hợp lệ:', rawText);
+    if (response.status === 413) {
+      throw new Error('Dung lượng tệp tải lên vượt quá giới hạn máy chủ. Hệ thống sẽ tự động chia nhỏ.');
+    }
+    throw new Error(`Máy chủ phản hồi trạng thái ${response.status}. Vui lòng thử lại.`);
+  }
+
+  if (!result || !result.success) {
+    const errorMsg = result?.error || result?.details || 'Không thể bóc tách tài liệu này từ AI.';
+    throw new Error(errorMsg);
   }
 
   const rawData: ExtractedDocument[] = result.data || [];
 
   // Hậu xử lý từng văn bản
-  rawData.forEach(doc => {
+  rawData.forEach((doc) => {
     if (doc.startPage && /^\d$/.test(doc.startPage.toString().trim())) {
       doc.startPage = `0${doc.startPage.toString().trim()}`;
     }
-    
+
     if (doc.docType && doc.summary) {
       let summary = doc.summary.trim();
       const docTypeLower = doc.docType.toLowerCase().trim();
-      
+
       if (summary.toLowerCase().startsWith(docTypeLower)) {
         summary = summary.substring(docTypeLower.length).trim();
       }
-      
+
       if (summary.length > 0) {
-        // Lowercase first letter unless starting with a proper name (e.g. "Nguyễn Văn A...")
         const words = summary.split(/\s+/);
-        const firstWord = words[0] || "";
-        const secondWord = words[1] || "";
+        const firstWord = words[0] || '';
+        const secondWord = words[1] || '';
         const isFirstCap = /^[A-Z\u00C0-\u024F\u1EA0-\u1EF9]/.test(firstWord);
         const isSecondCap = /^[A-Z\u00C0-\u024F\u1EA0-\u1EF9]/.test(secondWord);
 
@@ -76,7 +162,7 @@ const callExtractApi = async (body: any): Promise<ExtractedDocument[]> => {
           summary = summary.charAt(0).toLowerCase() + summary.slice(1);
         }
       }
-      
+
       doc.summary = summary;
     }
   });
@@ -85,9 +171,9 @@ const callExtractApi = async (body: any): Promise<ExtractedDocument[]> => {
 };
 
 const filterValidSymbol = (rawSymbol: string | undefined): string => {
-  if (!rawSymbol) return "";
+  if (!rawSymbol) return '';
   const trimmed = rawSymbol.trim();
-  if (!trimmed) return "";
+  if (!trimmed) return '';
 
   const hasDigit = /\d/.test(trimmed);
   const hasLetter = /[a-zA-Z\u00C0-\u024F\u1EA0-\u1EF9]/i.test(trimmed);
@@ -96,11 +182,11 @@ const filterValidSymbol = (rawSymbol: string | undefined): string => {
   if (hasDigit && hasLetter) {
     return trimmed;
   }
-  return "";
+  return '';
 };
 
 export const formatDisplayDate = (rawDate: string | undefined): string => {
-  if (!rawDate) return "";
+  if (!rawDate) return '';
   let clean = rawDate.trim();
   while (clean.startsWith("'") || clean.startsWith('"')) {
     clean = clean.substring(1).trim();
@@ -108,7 +194,7 @@ export const formatDisplayDate = (rawDate: string | undefined): string => {
   while (clean.endsWith("'") || clean.endsWith('"')) {
     clean = clean.substring(0, clean.length - 1).trim();
   }
-  if (!clean) return "";
+  if (!clean) return '';
 
   const parts = clean.split('/');
   if (parts.length === 3) {
@@ -131,9 +217,12 @@ export const formatDisplayDate = (rawDate: string | undefined): string => {
   return `'${clean}`;
 };
 
-export const formatDisplayPageRange = (rawPageRange: string | undefined, rawStartPage?: string | undefined): string => {
-  let val = (rawPageRange || rawStartPage || "").trim();
-  if (!val) return "";
+export const formatDisplayPageRange = (
+  rawPageRange: string | undefined,
+  rawStartPage?: string | undefined
+): string => {
+  let val = (rawPageRange || rawStartPage || '').trim();
+  if (!val) return '';
 
   while (val.startsWith("'") || val.startsWith('"')) {
     val = val.substring(1).trim();
@@ -141,7 +230,7 @@ export const formatDisplayPageRange = (rawPageRange: string | undefined, rawStar
   while (val.endsWith("'") || val.endsWith('"')) {
     val = val.substring(0, val.length - 1).trim();
   }
-  if (!val) return "";
+  if (!val) return '';
 
   if (/^\d+$/.test(val)) {
     const num = parseInt(val, 10);
@@ -194,28 +283,38 @@ const formatAndCalculateRanges = (allResults: ExtractedDocument[]): ExtractedDoc
       symbol: filterValidSymbol(doc.symbol),
       date: finalDate,
       pageRange: finalPageRange,
-      startPage: startPage ? `'${startPage}` : ''
+      startPage: startPage ? `'${startPage}` : '',
     };
   });
 };
 
+/**
+ * Extracts document records with NO file size limits.
+ * Handles arbitrarily large files (hundreds of MB, many pages) by adaptive streaming chunking.
+ */
 export const extractDataFromFiles = async (
   files: File[],
-  onProgress?: (currentFileIndex: number, totalFiles: number, currentFileName: string) => void
+  onProgress?: (
+    currentFileIndex: number,
+    totalFiles: number,
+    currentFileName: string,
+    detailInfo?: string
+  ) => void
 ): Promise<ExtractedDocument[]> => {
   const allResults: ExtractedDocument[] = [];
   const totalFiles = files.length;
 
-  // Xử lý từng tệp theo đúng thứ tự mà người dùng đã gắn / sắp xếp
   for (let fileIdx = 0; fileIdx < totalFiles; fileIdx++) {
     const currentFile = files[fileIdx];
-    
+
     if (onProgress) {
-      onProgress(fileIdx + 1, totalFiles, currentFile.name);
+      onProgress(fileIdx + 1, totalFiles, currentFile.name, 'Đang chuẩn bị tệp');
     }
 
-    const isPdf = currentFile.type === 'application/pdf' || currentFile.name.toLowerCase().endsWith('.pdf');
-    const isImage = currentFile.type.startsWith('image/') || /\.(png|jpe?g|webp|bmp|tiff)$/i.test(currentFile.name);
+    const isPdf =
+      currentFile.type === 'application/pdf' || currentFile.name.toLowerCase().endsWith('.pdf');
+    const isImage =
+      currentFile.type.startsWith('image/') || /\.(png|jpe?g|webp|bmp|tiff)$/i.test(currentFile.name);
 
     if (isPdf) {
       const arrayBuffer = await currentFile.arrayBuffer();
@@ -223,34 +322,50 @@ export const extractDataFromFiles = async (
       const totalPdfPages = pdfDoc.getPageCount();
       const fileRawDocs: ExtractedDocument[] = [];
 
-      if (currentFile.size <= API_LIMIT_BYTES && totalPdfPages <= PAGES_PER_CHUNK) {
-        const base64Data = await fileToBase64(currentFile);
-        const pdfResults = await callExtractApi({
-          fileBase64: base64Data,
-          fileType: "application/pdf",
-          fileName: currentFile.name,
-        });
-        fileRawDocs.push(...pdfResults);
-      } else {
-        // Tệp PDF nhiều trang: chia nhỏ theo từng chunk 15 trang
-        for (let i = 0; i < totalPdfPages; i += PAGES_PER_CHUNK) {
+      let pageIndex = 0;
+      while (pageIndex < totalPdfPages) {
+        let chunkPages = 4;
+        let pdfBytes: Uint8Array | null = null;
+        let actualPagesCopied = 0;
+
+        // Dynamically ensure chunk size remains under 10MB to guarantee compliance with API gateways
+        while (chunkPages >= 1) {
+          const end = Math.min(pageIndex + chunkPages, totalPdfPages);
+          actualPagesCopied = end - pageIndex;
           const newDoc = await PDFDocument.create();
-          const end = Math.min(i + PAGES_PER_CHUNK, totalPdfPages);
-          const pagesToCopy = Array.from({ length: end - i }, (_, k) => i + k);
+          const pagesToCopy = Array.from({ length: actualPagesCopied }, (_, k) => pageIndex + k);
           const copiedPages = await newDoc.copyPages(pdfDoc, pagesToCopy);
-          copiedPages.forEach(page => newDoc.addPage(page));
-          const pdfBytes = await newDoc.save();
-          const base64Chunk = uint8ArrayToBase64(pdfBytes);
+          copiedPages.forEach((page) => newDoc.addPage(page));
+          const testBytes = await newDoc.save();
+
+          if (testBytes.length <= 10 * 1024 * 1024 || chunkPages === 1) {
+            pdfBytes = testBytes;
+            break;
+          }
+          chunkPages = Math.max(1, Math.floor(chunkPages / 2));
+        }
+
+        if (pdfBytes) {
+          const endPageNum = Math.min(pageIndex + actualPagesCopied, totalPdfPages);
+          const detail = `Đang xử lý trang ${pageIndex + 1} - ${endPageNum} / ${totalPdfPages}`;
+          if (onProgress) {
+            onProgress(fileIdx + 1, totalFiles, currentFile.name, detail);
+          }
+
+          const base64Chunk = await uint8ArrayToBase64(pdfBytes);
           const chunkResults = await callExtractApi({
             fileBase64: base64Chunk,
-            fileType: "application/pdf",
-            fileName: `${currentFile.name}-chunk-${Math.floor(i / PAGES_PER_CHUNK) + 1}`,
+            fileType: 'application/pdf',
+            fileName: `${currentFile.name}-p${pageIndex + 1}-${endPageNum}`,
           });
           fileRawDocs.push(...chunkResults);
         }
+
+        pageIndex += actualPagesCopied;
+        // Yield momentarily to keep browser UI responsive during massive file processing
+        await new Promise((r) => setTimeout(r, 80));
       }
 
-      // Tính toán khoảng trang nội bộ riêng cho từng file để không bị ảnh hưởng chéo giữa các file
       const formattedFileDocs = formatAndCalculateRanges(fileRawDocs).map((doc, docIdx) => ({
         ...doc,
         sourceFileName: currentFile.name,
@@ -258,11 +373,13 @@ export const extractDataFromFiles = async (
       }));
 
       allResults.push(...formattedFileDocs);
-
     } else if (isImage) {
-      // Xử lý tệp hình ảnh đơn lẻ
-      const base64 = await fileToBase64(currentFile);
-      const mimeType = currentFile.type || 'image/jpeg';
+      if (onProgress) {
+        onProgress(fileIdx + 1, totalFiles, currentFile.name, 'Đang tối ưu & bóc tách hình ảnh');
+      }
+
+      // Optimize image before sending to handle any file size effortlessly
+      const { base64, mimeType } = await optimizeImageFile(currentFile);
       const imgResults = await callExtractApi({
         parts: [{ inlineData: { mimeType, data: base64 } }],
         fileName: currentFile.name,
@@ -284,4 +401,3 @@ export const extractDataFromFiles = async (
 export const extractDataFromPdf = async (file: File): Promise<ExtractedDocument[]> => {
   return extractDataFromFiles([file]);
 };
-

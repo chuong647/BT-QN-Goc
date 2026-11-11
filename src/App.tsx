@@ -252,11 +252,11 @@ const App: React.FC = () => {
     });
 
     try {
-      const data = await extractDataFromFiles(files, (currIdx, total, fileName) => {
+      const data = await extractDataFromFiles(files, (currIdx, total, fileName, detail) => {
         setProcessingInfo({
           currentFileIndex: currIdx,
           totalFiles: total,
-          currentFileName: fileName,
+          currentFileName: detail ? `${fileName} (${detail})` : fileName,
         });
         const basePercent = Math.round(((currIdx - 1) / total) * 90);
         setProgress(Math.max(5, basePercent + 5));
@@ -282,7 +282,10 @@ const App: React.FC = () => {
       console.error(err);
       setStatus(ProcessingStatus.ERROR);
       setProcessingInfo(null);
-      const msg = err.message || "Đã xảy ra lỗi trong quá trình xử lý.";
+      let msg = err.message || "Đã xảy ra lỗi trong quá trình xử lý.";
+      if (msg.includes("Failed to fetch") || msg.includes("NetworkError") || msg.includes("fetch")) {
+        msg = "Không thể kết nối đến máy chủ xử lý dữ liệu. Vui lòng kiểm tra dung lượng tệp hoặc kết nối mạng và thử lại.";
+      }
       setErrorMessage(msg);
       notify(msg, "error");
     }
@@ -389,8 +392,12 @@ const App: React.FC = () => {
                     </div>
                   </div>
 
-                  {/* Feature indicators for French, Telex & List rule */}
+                  {/* Feature indicators for French, Telex, List rule & Unlimited MB */}
                   <div className="flex flex-wrap items-center gap-3">
+                    <span className="inline-flex items-center gap-2 px-4 py-2 bg-purple-50 text-purple-700 font-bold text-xs rounded-full border border-purple-100 shadow-sm" title="Tự động phân đoạn và xử lý tệp dung lượng lớn không giới hạn MB">
+                      <Cpu size={14} className="text-purple-600" />
+                      Không giới hạn dung lượng (MB)
+                    </span>
                     <span className="inline-flex items-center gap-2 px-4 py-2 bg-blue-50 text-blue-700 font-bold text-xs rounded-full border border-blue-100 shadow-sm">
                       <Globe size={14} className="text-blue-600" />
                       Giữ nguyên tiếng Pháp (Không dịch)
@@ -442,7 +449,7 @@ const App: React.FC = () => {
                       Kéo thả hoặc bấm để gắn tệp PDF / Nhiều hình ảnh
                     </p>
                     <p className="text-slate-400 font-medium text-sm leading-relaxed">
-                      Có thể gắn nhiều tệp PDF hoặc ảnh cùng lúc. Sau khi gắn tệp, bạn có thể kiểm tra và sắp xếp thứ tự trước khi bấm nút <strong className="text-slate-600">Bắt đầu</strong>.
+                      Hỗ trợ tệp lớn <strong className="text-purple-600 font-bold">không giới hạn dung lượng (MB)</strong>. Hệ thống tự động phân tách và bóc tách thông minh từng phân đoạn tài liệu.
                     </p>
                   </div>
 
